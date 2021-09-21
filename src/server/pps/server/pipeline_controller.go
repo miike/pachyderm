@@ -50,9 +50,7 @@ func max(is ...int) int {
 // pipelineOp contains all of the relevent current state for a pipeline. It's
 // used by step() to take any necessary actions
 type pipelineOp struct {
-	m *ppsMaster
-	// a pachyderm client wrapping this operation's context (child of the PPS
-	// master's context, and cancelled at the end of step())
+	m            *ppsMaster
 	ctx          context.Context
 	pipelineInfo *pps.PipelineInfo
 	rc           *v1.ReplicationController
@@ -65,7 +63,8 @@ var (
 	errStaleRC      = errors.New("RC doesn't match pipeline version (likely stale)")
 )
 
-// step takes 'pipelineInfo', a newly-changed pipeline pointer in the pipeline collection, and
+// step takes 'pipeline', a pipeline whose kubernetes resources may need to be
+// updated, and
 // 1. retrieves its full pipeline spec and RC into the 'Details' field
 // 2. makes whatever changes are needed to bring the RC in line with the (new) spec
 // 3. updates 'pipelineInfo', if needed, to reflect the action it just took
@@ -483,17 +482,23 @@ func (op *pipelineOp) deletePipelineResources() error {
 // updated is already available to the caller in op.rc, but update() may be
 // called muliple times if the k8s write fails. It may be helpful to think of
 // the rc passed to update() as mutable, while op.rc is immutable.
-func (op *pipelineOp) updateRC(update func(rc *v1.ReplicationController)) error {
+func (op *pipelineOp) updateRC(update func(rc *v1.ReplicationController) bool) error {
 	kubeClient := op.m.a.env.GetKubeClient()
 	namespace := op.m.a.namespace
 	rc := kubeClient.CoreV1().ReplicationControllers(namespace)
 
 	newRC := *op.rc
 	// Apply op's update to rc
-	update(&newRC)
-	// write updated RC to k8s
-	if _, err := rc.Update(&newRC); err != nil {
-		return newRetriableError(err, "error updating RC")
+	if update(&newRC) {
+		oldReplicas := int32(0)
+		if op.rc.Spec.Replicas != nil {
+			oldReplicas = *op.rc.Spec.Replicas
+		}
+		log.Debugf("PPS master: scaling %q from %d to %d", op.name, oldReplicas, *newRC.Spec.Replicas)
+		// write updated RC to k8s
+		if _, err := rc.Update(&newRC); err != nil {
+			return newRetriableError(err, "error updating RC")
+		}
 	}
 	return nil
 }
@@ -512,23 +517,55 @@ func (op *pipelineOp) scaleUpPipeline() (retErr error) {
 		tracing.FinishAnySpan(span)
 	}()
 
-	// compute target pipeline parallelism
-	parallelism := uint64(1)
-	if op.pipelineInfo.Details.ParallelismSpec != nil {
-		parallelism = op.pipelineInfo.Details.ParallelismSpec.Constant
+	// Compute maximum parallelism
+	maxParallelism := int32(1)
+	if op.pipelineInfo.ParallelismSpec != nil && op.pipelineInfo.ParallelismSpec.Constant > 0 {
+		maxParallelism = int32(op.pipelineInfo.ParallelismSpec.Constant)
 	}
 
 	// update pipeline RC
-	return op.updateRC(func(rc *v1.ReplicationController) {
-		if rc.Spec.Replicas != nil && *op.rc.Spec.Replicas > 0 {
-			return // prior attempt succeeded
+	return op.updateRC(func(rc *v1.ReplicationController) bool {
+		var curReplicas int32
+		if rc.Spec.Replicas != nil && *rc.Spec.Replicas > 0 {
+			curReplicas = int32(*rc.Spec.Replicas)
 		}
-		rc.Spec.Replicas = new(int32)
-		if op.pipelineInfo.Details.Autoscaling {
-			*rc.Spec.Replicas = 1
-		} else {
-			*rc.Spec.Replicas = int32(parallelism)
+		target := func() int32 {
+			if !op.pipelineInfo.Autoscaling {
+				return maxParallelism // don't bother if Autoscaling is off
+			}
+			nTasks, nClaims, err := worker.TaskCount(pachClient.Ctx())
+			if err != nil {
+				log.Errorf("couldn't compute number of tasks for %q: %v", op.name, err)
+				return maxParallelism // default behavior if 'TaskCount' is unavailable
+			}
+			if nClaims >= nTasks || nTasks <= curReplicas {
+				return curReplicas // don't change (can't scale down w/o dropping work)
+			}
+			log.Debugf("Beginning scale-up check for %q, which has %d unclaimed tasks",
+				op.name, unclaimedTasks)
+			if nTasks > maxParallelism {
+				return maxParallelism
+			}
+			return nTasks
+		}()
+		if curReplicas == target {
+			return false // no changes necessary
 		}
+
+		// Scaling is being updated; schedule another check in scaleUpInterval
+		go func() {
+			time.Sleep(scaleUpInterval)
+			select {
+			case op.m.eventCh <- &pipelineEvent{eventType: writeEv, pipeline: op.name}:
+				break
+			case <-op.m.masterClient.Ctx().Done():
+				break
+			}
+		}()
+
+		// Update the # of replicas
+		rc.Spec.Replicas = &target
+		return true
 	})
 }
 
@@ -546,11 +583,12 @@ func (op *pipelineOp) scaleDownPipeline() (retErr error) {
 		tracing.FinishAnySpan(span)
 	}()
 
-	return op.updateRC(func(rc *v1.ReplicationController) {
-		if rc.Spec.Replicas != nil && *op.rc.Spec.Replicas == 0 {
-			return // prior attempt succeeded
+	return op.updateRC(func(rc *v1.ReplicationController) bool {
+		if rc.Spec.Replicas != nil && rc.Spec.Replicas == 0 {
+			return false // prior attempt succeeded
 		}
 		rc.Spec.Replicas = &zero
+		return true
 	})
 }
 
