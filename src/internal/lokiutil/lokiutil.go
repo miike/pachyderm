@@ -51,7 +51,7 @@ func forEachLine(resp *loghttp.QueryResponse, f func(t time.Time, line string) e
 
 // QueryRange calls QueryRange on the passed loki.Client and calls f with each
 // logline.
-func QueryRange(ctx context.Context, c *loki.Client, queryStr string, from, through time.Time, follow bool, f func(t time.Time, line string) error) error {
+func QueryRange(ctx context.Context, c loki.Client, queryStr string, from, through time.Time, follow bool, f func(t time.Time, line string) error) error {
 	for {
 		// Unfortunately there's no way to pass ctx to this function.
 		resp, err := c.QueryRange(queryStr, maxLogMessages, from, through, logproto.FORWARD, 0, 0, true)
