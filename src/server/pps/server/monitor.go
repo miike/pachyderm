@@ -191,16 +191,19 @@ func (pc *pipelineController) monitorPipeline(ctx context.Context, pipelineInfo 
 							return err
 						}
 
-						// Stay running while commits are available
+						// Stay running while commits are available and there's still job-related compaction to do
 					running:
 						for {
-							// Wait for the commit to be finished before blocking on the
-							// job because the job may not exist yet.
 							pachClient := pc.env.GetPachClient(ctx)
-							if _, err := pachClient.WaitCommit(ci.Commit.Branch.Repo.Name, ci.Commit.Branch.Name, ci.Commit.ID); err != nil {
+							if _, err := pachClient.WaitJob(pipeline, ci.Commit.ID, true); err != nil {
 								return err
 							}
-							if _, err := pachClient.InspectJob(ci.Commit.Branch.Repo.Name, ci.Commit.ID, true); err != nil {
+							// wait until meta commit compaction finishes
+							if _, err := pachClient.PfsAPIClient.InspectCommit(ctx, &pfs.InspectCommitRequest{
+								Commit: client.NewSystemRepo(pipeline, pfs.MetaRepoType).
+									NewCommit(ci.Commit.Branch.Name, ci.Commit.ID),
+								Wait: pfs.CommitState_FINISHED,
+							}); err != nil {
 								return err
 							}
 
